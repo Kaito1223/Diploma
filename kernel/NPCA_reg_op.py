@@ -8,9 +8,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
+from make_dataset import make_data_combined
 
 Array = np.ndarray
-
 
 def rbf_kernel(Z1: Array, Z2: Array, sigma: float = 1.0) -> Array:
     """RBF kernel on joint vectors Z; k(z,z') = exp(-||z-z'||^2 / (2 sigma^2))"""
@@ -216,24 +216,6 @@ def evaluate_kernels(Z_train: Array,
     df = pd.DataFrame(rows)
     return df
 
-
-
-def make_synthetic_xy(n_train: int = 80, n_test: int = 80, seed: int = 0) -> Tuple[Array, Array]:
-    rng = np.random.default_rng(seed)
-    n_total = int(n_train) + int(n_test)
-
-    x = np.linspace(-2*np.pi, 2*np.pi, n_total)
-    y = np.sin(x) + 0.05 * np.random.randn(n_total)
-    Z = np.column_stack((x, y))
-
-    idx = rng.permutation(n_total)
-    Z = Z[idx]
-    split = int(0.8 * n_total)
-    Z_train = Z[:split]
-    Z_test = Z[split:]
-    return Z_train, Z_test
-
-
 def _torch_kernel_from_cfg(cfg: KernelConfig):
     if cfg.kind == "rbf":
         sigma = float(cfg.params.get("sigma", 1.0))
@@ -271,70 +253,93 @@ class TorchProjector:
         self.m = self.A_m.shape[1]
 
         self.mean_y = float(model.Z_train[:, -1].mean())
+        
+    def E_phi_batch(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        """
+        [NEW] Vectorized calculation of E_phi for a batch of (X,Y) pairs.
+        E_phi(x,y) = k_c(z,z) - ||A_m^T k_c(z)||^2, where z=(x,y).
 
-    def E_phi(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """E_phi(x,y) = k_c(z,z) - ||A_m^T k_c(z)||^2,  z=(x,y)."""
-        assert x.ndim == 1 and y.ndim == 0
-        z = torch.cat([x, y.view(1)], dim=0).unsqueeze(0)  # (1,p)
+        Args:
+            X: Batch of x vectors, shape (b, p-1).
+            Y: Batch of y values, shape (b, 1).
 
-        k_row = self.k_torch(z, self.Ztr).ravel()        # (n,)
-        row_mean = k_row.mean()
-        k_c_row = k_row - row_mean - self.bar_k + self.bar_K
+        Returns:
+            Tensor of feature errors for each sample in the batch, shape (b,).
+        """
+        b = X.shape[0]
+        Z = torch.cat([X, Y], dim=1)
+
+        k_matrix = self.k_torch(Z, self.Ztr)
+        row_means = k_matrix.mean(dim=1, keepdim=True)
+
+        k_c_matrix = k_matrix - row_means - self.bar_k + self.bar_K
 
         if self.m == 0:
-            proj_energy = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            proj_energy = torch.zeros(b, dtype=torch.float32, device=self.device)
         else:
-            t = (self.A_m.T @ k_c_row)
-            proj_energy = (t * t).sum()
+            T = (self.A_m.T @ k_c_matrix.T).T
+            proj_energy = (T * T).sum(dim=1)
 
-        k_self = self.k_torch(z, z)[0, 0]
-        k_c_self = k_self - 2.0 * row_mean + self.bar_K[0]
+        k_selfs = torch.diag(self.k_torch(Z, Z))
 
-        return k_c_self - proj_energy
+        k_c_selfs = k_selfs - 2.0 * row_means.squeeze() + self.bar_K[0]
 
-    def predict_y(self,
-                  x_np: Array,
-                  y_init: Optional[float] = None,
-                  lr: float = 0.05,
-                  steps: int = 300,
-                  restarts: int = 1,
-                  init_perturb: float = 0.5) -> float:
-        """Minimize E_phi(x,y) over y with AdamW, return y_hat (pre-image space)."""
-        x = torch.tensor(x_np, dtype=torch.float32, device=self.device)
+        return k_c_selfs - proj_energy
+    
+    def predict_y_batch(self,
+                        X_np: Array,
+                        y_init: Optional[Array] = None,
+                        lr: float = 0.05,
+                        steps: int = 300,
+                        restarts: int = 1,
+                        init_perturb: float = 0.5) -> Array:
+        
+        b = X_np.shape[0]
+        X = torch.tensor(X_np, dtype=torch.float32, device=self.device)
 
-        base_init = self.mean_y if y_init is None else float(y_init)
-        best_y = None
-        best_val = float('inf')
+        best_Y = torch.zeros(b, 1, dtype=torch.float32, device=self.device)
+        best_vals = torch.full((b,), float('inf'), dtype=torch.float32, device=self.device)
 
         for r in range(restarts):
-            y0 = base_init + (np.random.randn() * init_perturb if restarts > 1 else 0.0)
-            y = torch.tensor([y0], dtype=torch.float32, device=self.device, requires_grad=True)
-            opt = torch.optim.AdamW([y], lr=lr)
+            if y_init is not None:
+                base_init = torch.tensor(y_init, dtype=torch.float32, device=self.device).view(-1, 1)
+            else:
+                base_init = torch.full((b, 1), self.mean_y, dtype=torch.float32, device=self.device)
+            
+            if restarts > 1:
+                perturbation = torch.randn(b, 1, device=self.device) * init_perturb
+                Y0 = base_init + perturbation
+            else:
+                Y0 = base_init
+
+            Y = Y0.clone().detach().requires_grad_(True)
+            opt = torch.optim.AdamW([Y], lr=lr)
 
             for _ in range(steps):
                 opt.zero_grad(set_to_none=True)
-                loss = self.E_phi(x, y[0])
+                loss = self.E_phi_batch(X, Y).sum()
                 loss.backward()
                 opt.step()
 
-            val = float(self.E_phi(x, y[0]).item())
-            if val < best_val:
-                best_val = val
-                best_y = float(y.item())
+            with torch.no_grad():
+                current_vals = self.E_phi_batch(X, Y)
+                is_better = current_vals < best_vals
+                best_vals[is_better] = current_vals[is_better]
+                best_Y[is_better] = Y[is_better]
 
-        return best_y
-
+        return best_Y.squeeze().cpu().numpy()    
 
 def evaluate_kernels_with_torch_argmin(Z_train: Array,
-                                       Z_test: Array,
+                                       X_test: Array,
+                                       y_test: Optional[Array] = None,
+                                       batch_size: Optional[int] = None,
                                        kernel_choice: str = "all",
                                        poly_degrees: Union[str, List[int]] = "all",
-                                       rbf_sigmas: Union[str, List[float]] = [0.25, 0.5, 1.0, 2.0],
+                                       rbf_sigmas: Union[str, List[float]] = "all",
                                        m: Optional[int] = None,
                                        evr_target: Optional[float] = 0.95,
                                        lr: float = 0.05,
                                        steps: int = 300) -> pd.DataFrame:
-    """For each kernel config: fit KPCA, then Torch-minimize y for each test x, report pre-image space MSE(ŷ,y) and mean feature-space residual at optimum."""
     if poly_degrees == "all":
         poly_degrees = [2, 3, 4]
     if rbf_sigmas == "all":
@@ -350,25 +355,39 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
 
     rows = []
     results = []
-    X_te = Z_test[:, :-1]
-    y_true = Z_test[:, -1]
+    # X_te = Z_test[:, :-1]
+    # y_true = Z_test[:, -1]
 
     for cfg in configs:
-
+        print(f"Evaluating kernel: {cfg.kind}, params: {cfg.params}")
         model = kpca_fit(Z_train, cfg, m=m, evr_target=evr_target)
         projector = TorchProjector(model)
 
-        y_pred = np.array([projector.predict_y(x, lr=lr, steps=steps) for x in X_te], dtype=float)
-
-        mse_y = float(np.mean((y_pred - y_true) ** 2))
+        if batch_size is None or batch_size >= len(X_test):
+            y_pred = projector.predict_y_batch(X_test, lr=lr, steps=steps)
+        else:
+            # Process in mini-batches
+            y_pred_parts = []
+            num_samples = len(X_test)
+            for i in range(0, num_samples, batch_size):
+                print(f"  Processing batch {i//batch_size + 1}...")
+                X_batch = X_test[i : i + batch_size]
+                y_pred_batch = projector.predict_y_batch(X_batch, lr=lr, steps=steps)
+                y_pred_parts.append(y_pred_batch)
+            
+            # Combine the results from all batches
+            y_pred = np.concatenate(y_pred_parts)
+        #y_pred = projector.predict_y_batch(X_te, lr=lr, steps=steps, restarts=1)
+        if y_test is not None:
+            mse_y = float(np.mean((y_pred - y_test) ** 2))
+        else:
+            mse_y = None
 
         with torch.no_grad():
-            residuals = []
-            for x, yhat in zip(X_te, y_pred):
-                e = projector.E_phi(torch.tensor(x, dtype=torch.float32),
-                                    torch.tensor(yhat, dtype=torch.float32))
-                residuals.append(float(e.item()))
-        mean_residual = float(np.mean(residuals))
+            x_tensor = torch.tensor(X_test, dtype=torch.float32)
+            y_pred_tensor = torch.tensor(y_pred, dtype=torch.float32).view(-1, 1)
+            residuals = projector.E_phi_batch(x_tensor, y_pred_tensor)
+            mean_residual = float(residuals.mean().item())
 
         rows.append({
             "kernel": cfg.kind,
@@ -377,42 +396,61 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
             "MSE_yhat_vs_y": mse_y,
             "mean_feature_residual": mean_residual
         })
-
         results.append({
             "kernel": cfg.kind,
+            "params": cfg.params,
             "pred": y_pred
         })
 
     return pd.DataFrame(rows), results
+ 
 
+if __name__ == "__main__":
+    Z_train, Z_test = make_data_combined(n_train=100, n_test=20, n_features=1 ,seed=0)
 
-Z_train, Z_test = make_synthetic_xy()
+    df_results = evaluate_kernels(
+        Z_train,
+        Z_test,
+        kernel_choice="all",
+        poly_degrees="all",
+        rbf_sigmas="all",
+        m=None,
+        evr_target=0.99
+    )
+    print("Feature-space orthogonal MSE (train/test):")
+    print(df_results)
 
-df_results = evaluate_kernels(
-    Z_train,
-    Z_test,
-    kernel_choice="all",
-    poly_degrees="all",
-    rbf_sigmas="all",
-    m=None,
-    evr_target=0.99
-)
-print("Feature-space orthogonal MSE (train/test):")
-print(df_results)
+    X_train = Z_train[:, :-1]
+    y_train = Z_train[:, -1]
+    Xq = np.linspace(X_train.min(), X_train.max(), 400)[:, None]
 
-df_argmin, results = evaluate_kernels_with_torch_argmin(
-    Z_train, Z_test,
-    kernel_choice="all",
-    poly_degrees="all",
-    rbf_sigmas="all",
-    m=None,
-    evr_target=0.99,
-    lr=0.05,
-    steps=300
-)
-print("\nInput-space MSE on y (argmin over y) and residual at optimum:")
-print(df_argmin)
+    X_test = Z_test[:, :-1]
+    y_test = Z_test[:, -1]
 
-# print("Predictions for each kernel config:")
-# for res in results:
-#     print(f"Kernel: {res['kernel']}, Predictions ŷ: {res['pred']}")
+    df_argmin, results = evaluate_kernels_with_torch_argmin(
+        Z_train, Xq,
+        kernel_choice="rbf",
+        poly_degrees="all",
+        rbf_sigmas="all",
+        m=None,
+        evr_target=0.99,
+        lr=0.05,
+        steps=300
+    )
+    print("\nInput-space MSE on y (argmin over y) and residual at optimum:")
+    print(df_argmin)
+
+    yq_preds = { (row['kernel'], str(row['params'])): row['pred'] for row in results }
+
+    plt.figure(figsize=(8, 5))
+    for (kernel, params), yq_pred in yq_preds.items():
+        plt.plot(Xq[:, 0], yq_pred, label=f"{kernel}, {params}")
+
+    plt.scatter(X_train[:, 0], y_train, s=25, color="red", alpha=0.8, label="train")
+    plt.scatter(X_test[:, 0], y_test, s=25, color="blue", alpha=0.7, label="test")
+
+    plt.xlabel("x")
+    plt.ylabel("y / prediction")
+    plt.title(f"NPCA regression")
+    plt.legend()
+    plt.show()
