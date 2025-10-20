@@ -7,6 +7,7 @@ def _prepare_data(
     n_test: int,
     n_features: int,
     seed: int,
+    noise_level: float = 0.05,
     X: Optional[Array] = None,
     y: Optional[Array] = None,
     distribution: str = 'uniform',
@@ -30,7 +31,6 @@ def _prepare_data(
     """
     rng = np.random.default_rng(seed)
     
-    # --- Mode 1: Use Existing Dataset ---
     if X is not None and y is not None:
         if X.ndim == 1: X = X.reshape(-1, 1)
         if len(X) != len(y):
@@ -41,7 +41,6 @@ def _prepare_data(
         
         X_gen, y_gen = X, y
 
-    # --- Mode 2: Generate New Data ---
     else:
         n_total = n_train + n_test
         dist_params = dist_params or {}
@@ -68,7 +67,7 @@ def _prepare_data(
             
         # Generate target y based on the features
         x_sum = np.sum(X_gen, axis=1)
-        y_gen = np.sin(x_sum) + 0.05 * rng.standard_normal(n_total)
+        y_gen = np.sin(x_sum) + noise_level * rng.standard_normal(n_total)
 
     # Shuffle the data (either provided or generated)
     idx = rng.permutation(len(X_gen))
@@ -82,6 +81,7 @@ def make_data_separated(
     n_test: int = 80, 
     n_features: int = 1,
     seed: int = 0,
+    noise_level: float = 0.05,
     X: Optional[Array] = None,
     y: Optional[Array] = None,
     distribution: str = 'uniform',
@@ -108,7 +108,7 @@ def make_data_separated(
         A tuple of four numpy arrays in the order: (X_test, y_test, X_train, y_train).
     """
     X_shuffled, y_shuffled = _prepare_data(
-        n_train, n_test, n_features, seed, X, y, distribution, dist_params
+        n_train, n_test, n_features, seed, noise_level, X, y, distribution, dist_params
     )
 
     # Define the split point. Use n_train for splitting.
@@ -127,6 +127,7 @@ def make_data_combined(
     n_test: int = 80, 
     n_features: int = 1,
     seed: int = 0,
+    noise_level: float = 0.05,
     X: Optional[Array] = None,
     y: Optional[Array] = None,
     distribution: str = 'uniform',
@@ -145,9 +146,8 @@ def make_data_combined(
         A tuple of two numpy arrays in the order: (Z_test, Z_train).
     """
     X_shuffled, y_shuffled = _prepare_data(
-        n_train, n_test, n_features, seed, X, y, distribution, dist_params
+        n_train, n_test, n_features, seed, noise_level, X, y, distribution, dist_params
     )
-
     Z_shuffled = np.column_stack((X_shuffled, y_shuffled))
 
     # Define the split point

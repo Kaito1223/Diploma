@@ -1,4 +1,5 @@
 from __future__ import annotations
+from sklearn.datasets import make_circles
 
 import numpy as np
 from dataclasses import dataclass
@@ -39,7 +40,6 @@ class KernelConfig:
             return lambda A, B: rbf_kernel(A, B, sigma=sigma)
         elif self.kind == "poly":
             degree = int(self.params.get("degree", 2))
-            # default c0 = 0.0 per your spec
             c0 = float(self.params.get("c0", 0.0))
             return lambda A, B: poly_kernel(A, B, degree=degree, c0=c0)
         else:
@@ -160,7 +160,7 @@ def kpca_train_mse_feature(model: KPCAResult) -> float:
         return float(model.lambdas.mean())
     residual_lambdas = model.lambdas[model.m:]
     Q_res = model.Q[:, model.m:]
-    # Per-point errors: sum_j residual_lambda_j * Q_{ij}^2
+
     E_per = (Q_res**2) @ residual_lambdas
     return float(E_per.mean())
 
@@ -341,7 +341,7 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
                                        lr: float = 0.05,
                                        steps: int = 300) -> pd.DataFrame:
     if poly_degrees == "all":
-        poly_degrees = [2, 3, 4]
+        poly_degrees = [1, 2, 3, 4]
     if rbf_sigmas == "all":
         rbf_sigmas = [0.25, 0.5, 1.0, 2.0]
 
@@ -406,13 +406,21 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
  
 
 if __name__ == "__main__":
-    Z_train, Z_test = make_data_combined(n_train=100, n_test=20, n_features=1 ,seed=0)
+    # n_samples = 200
+    # theta = np.linspace(0, 2 * np.pi, n_samples)
+    # r = 1.0
+    # X = np.column_stack((r * np.cos(theta), r * np.sin(theta)))
+
+    # noise_level = 0.5
+    # X_noisy = X + noise_level * np.random.randn(*X.shape)
+
+    Z_train, Z_test = make_data_combined(n_train=450, n_test=50, n_features=1 ,seed=0, noise_level=0.25)
 
     df_results = evaluate_kernels(
         Z_train,
         Z_test,
         kernel_choice="all",
-        poly_degrees="all",
+        poly_degrees=[1, 2, 3],
         rbf_sigmas="all",
         m=None,
         evr_target=0.99
@@ -430,8 +438,8 @@ if __name__ == "__main__":
     df_argmin, results = evaluate_kernels_with_torch_argmin(
         Z_train, Xq,
         kernel_choice="rbf",
-        poly_degrees="all",
-        rbf_sigmas="all",
+        poly_degrees=[1, 2, 3],
+        rbf_sigmas=[0.5, 2, 4, 6],
         m=None,
         evr_target=0.99,
         lr=0.05,
@@ -442,15 +450,17 @@ if __name__ == "__main__":
 
     yq_preds = { (row['kernel'], str(row['params'])): row['pred'] for row in results }
 
-    plt.figure(figsize=(8, 5))
     for (kernel, params), yq_pred in yq_preds.items():
-        plt.plot(Xq[:, 0], yq_pred, label=f"{kernel}, {params}")
+        plt.figure(figsize=(8, 5))
 
-    plt.scatter(X_train[:, 0], y_train, s=25, color="red", alpha=0.8, label="train")
-    plt.scatter(X_test[:, 0], y_test, s=25, color="blue", alpha=0.7, label="test")
+        plt.plot(Xq[:, 0], yq_pred, label=f"Prediction: {kernel}, {params}")
 
-    plt.xlabel("x")
-    plt.ylabel("y / prediction")
-    plt.title(f"NPCA regression")
-    plt.legend()
+        plt.scatter(X_train[:, 0], y_train, s=25, color="red", alpha=0.8, label="train")
+        plt.scatter(X_test[:, 0], y_test, s=25, color="blue", alpha=0.7, label="test")
+
+        plt.xlabel("x")
+        plt.ylabel("y / prediction")
+        plt.title(f"NPCA Regression with {kernel}")
+        plt.legend()
+
     plt.show()

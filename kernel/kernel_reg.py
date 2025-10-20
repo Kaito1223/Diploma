@@ -182,9 +182,22 @@ class KernelRegression:
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 if __name__ == "__main__":
-    n_train = 100
-    X_train, y_train, X_test, y_test = make_data_separated(n_train=n_train, n_test=30, seed=0)
+    n_train = 450
+    n_test = 50
+    X_train, y_train, X_test, y_test = make_data_separated(n_train=n_train, n_test=n_test, seed=0)
 
+    # n_trains = 200
+    # n_tests = 50
+    # n_samples = n_trains + n_tests
+    # theta = np.linspace(0, 2 * np.pi, n_samples)
+    # r = 1.0
+    # X = np.column_stack((r * np.cos(theta), r * np.sin(theta)))
+
+    # noise_level = 0.5
+    # X_noisy = X + noise_level * np.random.randn(*X.shape)
+
+    # X_train, y_train, X_test, y_test = make_data_separated(n_train=n_trains, n_test=n_tests, n_features=1 ,seed=0, X=X[:, 0], y=X[:, 1])
+    
     kr = KernelRegression(kernel="rbf", h=0.8, standardize=True).fit(X_train, y_train)
 
     Xz, mu, sd = zscore(X_train)
