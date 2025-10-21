@@ -9,32 +9,32 @@ from kernel_reg import KernelRegression, zscore, cdist, pairwise_sq_dists_numpy
 
 def run_npca_regression(Z_train: np.ndarray, X_test: np.ndarray, y_test: np.ndarray, **kwargs) -> Dict[str, Any]:
     """
-    Runs the NPCA regression model and returns the best result.
+    NPCA regression model and returns the best result.
     """
     print("Running NPCA Regression...")
     df_results, _ = evaluate_kernels_with_torch_argmin(Z_train, X_test, y_test, **kwargs)
     if df_results.empty:
-        return {"mse": np.inf, "params": {}}
-    best_result = df_results.loc[df_results['MSE_yhat_vs_y'].idxmin()]
+        return {"rmse": np.inf, "params": {}}
+    best_result = df_results.loc[df_results['RMSE_yhat_vs_y'].idxmin()]
     return {
-        "mse": best_result['MSE_yhat_vs_y'],
+        "rmse": best_result['RMSE_yhat_vs_y'],
         "params": f"kernel={best_result['kernel']}, params={best_result['params']}"
     }
 
 def run_spline_smoothing(X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray, y_test: np.ndarray, **kwargs) -> Dict[str, Any]:
     """
-    Runs the Thin Plate Spline regression model.
+    Thin Plate Spline regression model.
     """
     print("Running Spline Smoothing...")
     model = TPSRegressor(**kwargs)
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
-    mse = np.mean((y_test - y_pred)**2)
-    return {"mse": mse, "params": kwargs}
+    rmse = np.sqrt(np.mean((y_test - y_pred)**2))
+    return {"rmse": rmse, "params": kwargs}
 
 def run_kernel_regression(X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray, y_test: np.ndarray, **kwargs) -> Dict[str, Any]:
     """
-    Runs the Kernel regression model with bandwidth selection.
+    Kernel regression model with bandwidth selection.
     """
     print("Running Kernel Regression...")
     model = KernelRegression(**kwargs)
@@ -53,29 +53,32 @@ def run_kernel_regression(X_train: np.ndarray, y_train: np.ndarray, X_test: np.n
     model.h = best_h
     
     y_pred = model.predict(X_test)
-    mse = np.mean((y_test - y_pred)**2)
+    rmse = np.sqrt(np.mean((y_test - y_pred)**2))
     
     params = kwargs.copy()
     params['selected_h'] = best_h
-    return {"mse": mse, "params": params}
+    return {"rmse": rmse, "params": params}
 
 def evaluate_models(datasets: int, models_to_run: List[str], model_params: Dict[str, Dict[str, Any]]):
-    """
-    Main evaluation loop.
-    """
+
     results = []
     
     for i in range(datasets):
         print(f"\n--- Starting Dataset {i+1}/{datasets} ---")
         
         X_train, y_train, X_test, y_test = make_data_separated(
-            n_train=400, n_test=100, n_features=1, seed=i
+            n_train=400, n_test=100, n_features=1, seed=i, noise_level=0.5
         )
         Z_train, Z_test = make_data_combined(
-            n_train=400, n_test=100, n_features=1, seed=i
+            n_train=400, n_test=100, n_features=1, seed=i, noise_level=0.5
         )
-        # The Z_test from make_data_combined includes y, so we need to use the X and y from separated
-        # to ensure consistency for the NPCA model's test set.
+
+        X_clean_train, y_clean_train, X_clean_test, y_clean_test = make_data_separated(
+            n_train=400, n_test=100, n_features=1, seed=i, noise_level=0.0
+        )
+        Z_train_clean, Z_test_clean = make_data_combined(
+            n_train=400, n_test=100, n_features=1, seed=i, noise_level=0.0
+        )
         
         for model_name in models_to_run:
             if model_name == 'npca':
@@ -94,10 +97,10 @@ def evaluate_models(datasets: int, models_to_run: List[str], model_params: Dict[
             results.append({
                 "dataset": i + 1,
                 "model": model_name,
-                "mse": result['mse'],
+                "rmse": result['rmse'],
                 "params": str(result['params'])
             })
-            print(f"  {model_name.upper()} MSE: {result['mse']:.4f}")
+            print(f"  {model_name.upper()} RMSE: {result['rmse']:.4f}")
 
     return pd.DataFrame(results)
 
@@ -105,15 +108,11 @@ if __name__ == '__main__':
     NUM_DATASETS = 5
     
     # Specify which models to run: 'npca', 'spline', 'kernel' or a list
-    MODELS = ['npca', 'spline', 'kernel'] # Use 'all' or a list e.g., ['spline', 'kernel']
+    MODELS = ['npca', 'spline', 'kernel']
 
-    # --- Model Parameters ---
-    # Define parameters for each model.
-    # For NPCA, you can specify kernel types and their parameters.
-    # For Spline and Kernel, you specify their respective constructor arguments.
     MODEL_CONFIGS = {
         'npca': {
-            'kernel_choice': "all", # 'rbf', 'poly', or 'all'
+            'kernel_choice': "all",
             'poly_degrees': [2, 3],
             'rbf_sigmas': [0.5, 1.0, 2.0],
             'evr_target': 0.99,
@@ -140,11 +139,11 @@ if __name__ == '__main__':
     
     print("\n--- Final Model Rankings ---")
 
-    ranking = final_results.groupby('model')['mse'].mean().sort_values().reset_index()
+    ranking = final_results.groupby('model')['rmse'].mean().sort_values().reset_index()
     ranking['rank'] = ranking.index + 1
     
     print("Average MSE across all datasets:")
     print(ranking)
     
     print("\nDetailed results per dataset:")
-    print(final_results.sort_values(by=['dataset', 'mse']))
+    print(final_results.sort_values(by=['dataset', 'rmse']))

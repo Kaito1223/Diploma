@@ -149,72 +149,83 @@ def kpca_feature_error(model: KPCAResult, z: Array) -> float:
         return float(k_c_self)
     k_c_row, k_c_self = centered_kernel_row(model, z)
     t = model.A_m.T @ k_c_row
-    return float(k_c_self - np.dot(t, t))
+    return float(np.maximum(0.0, k_c_self - np.dot(t, t)))
 
 
-def kpca_train_mse_feature(model: KPCAResult) -> float:
+def kpca_train_rmse_feature(model: KPCAResult) -> float:
     """Training mean feature-space error using eigen shortcut:
        E_phi(z_i) = sum_{j>m} lambda_j * Q_{ij}^2"""
     n = model.Kc.shape[0]
     if model.m == 0:
-        return float(model.lambdas.mean())
+        return float(np.sqrt(model.lambdas.mean(), 0))
     residual_lambdas = model.lambdas[model.m:]
     Q_res = model.Q[:, model.m:]
 
     E_per = (Q_res**2) @ residual_lambdas
-    return float(E_per.mean())
+    mse = E_per.mean()
 
+    return float(np.sqrt(np.maximum(0.0, mse)))
 
-def kpca_test_mse_feature(model: KPCAResult, Z_test: Array) -> float:
+def kpca_test_rmse_feature(model: KPCAResult, Z_test: Array) -> float:
     errs = [kpca_feature_error(model, z) for z in Z_test]
-    return float(np.mean(errs))
+    mse = np.mean(errs)
+    return float(np.sqrt(np.maximum(0.0, mse)))
 
-
-def evaluate_kernels(Z_train: Array,
-                     Z_test: Optional[Array] = None,
-                     kernel_choice: str = "all",
-                     poly_degrees: Union[str, List[int]] = "all",
-                     rbf_sigmas: Union[str, List[float]] = [0.25, 0.5, 1.0, 2.0],
-                     m: Optional[int] = None,
-                     evr_target: Optional[float] = 0.95) -> pd.DataFrame:
+def fit_all_kernels(Z_train: Array,
+                    kernel_choice: str = "all",
+                    poly_degrees: Union[str, List[int]] = "all",
+                    rbf_sigmas: Union[str, List[float]] = "all",
+                    m: Optional[int] = None,
+                    evr_target: Optional[float] = 0.95) -> List[KPCAResult]:
     """
-    Evaluate multiple kernels/configs and return a DataFrame of feature-space MSEs.
-    - kernel_choice: "rbf", "poly", or "all"
-    - poly_degrees: list of ints or "all" -> [2,3,4]
-    - rbf_sigmas: list of floats or "all" -> [0.25, 0.5, 1.0, 2.0]
-    - choose m directly OR via evr_target (explained variance in feature space)
+    Fits one model for each kernel config and returns a list of fitted models.
     """
-    if poly_degrees == "all":
-        poly_degrees = [1, 2, 3, 4]
-    if rbf_sigmas == "all":
-        rbf_sigmas = [0.25, 0.5, 1.0, 2.0]
-
+    if poly_degrees == "all": poly_degrees = [1, 2, 3, 4]
+    if rbf_sigmas == "all": rbf_sigmas = [0.25, 0.5, 1.0, 2.0]
+    
     configs: List[KernelConfig] = []
     if kernel_choice in ("poly", "all"):
-        for d in poly_degrees:  # c0 fixed to 0.0 per your request
+        for d in poly_degrees:
             configs.append(KernelConfig(kind="poly", params={"degree": int(d), "c0": 0.0}))
     if kernel_choice in ("rbf", "all"):
         for s in rbf_sigmas:
             configs.append(KernelConfig(kind="rbf", params={"sigma": float(s)}))
 
-    rows = []
+    models = []
+    print(f"Fitting {len(configs)} models...")
     for cfg in configs:
+        print(f"  Fitting {cfg.kind} with params: {cfg.params}")
         model = kpca_fit(Z_train, cfg, m=m, evr_target=evr_target)
-        train_mse = kpca_train_mse_feature(model)
+        models.append(model)
+    print("Model fitting complete.")
+    return models
+
+def evaluate_models(models: List[KPCAResult],
+                    Z_test: Optional[Array] = None) -> pd.DataFrame:
+    """
+    Evaluates a list of pre-fitted models on new data.
+    Calculates train/test feature-space RMSE.
+    """
+    print(f"Evaluating feature-space RMSE for {len(models)} models...")
+    rows = []
+    for model in models:
+        cfg = model.kernel_cfg
+        
+        train_rmse = kpca_train_rmse_feature(model)
+        
         if Z_test is not None:
-            test_mse = kpca_test_mse_feature(model, Z_test)
+            test_rmse = kpca_test_rmse_feature(model, Z_test)
         else:
-            test_mse = np.nan
+            test_rmse = np.nan
+        
         rows.append({
             "kernel": cfg.kind,
             "params": cfg.params,
             "m": model.m,
-            "train_feature_MSE": train_mse,
-            "test_feature_MSE": test_mse
+            "train_feature_RMSE": train_rmse,
+            "test_feature_RMSE": test_rmse
         })
-
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 def _torch_kernel_from_cfg(cfg: KernelConfig):
     if cfg.kind == "rbf":
@@ -238,7 +249,7 @@ def _torch_kernel_from_cfg(cfg: KernelConfig):
 
 class TorchProjector:
     """Optimize y for given x by minimizing feature-space residual E_phi(x,y)."""
-    def __init__(self, model: KPCAResult, device: Optional[str] = None):
+    def __init__(self, model: KPCAResult, k:int = 0, lambda_knn: float = 0.0, device: Optional[str] = None):
         self.model = model
         self.device = torch.device(device) if device else torch.device('cpu')
 
@@ -252,20 +263,15 @@ class TorchProjector:
         self.p = self.Ztr.shape[1]
         self.m = self.A_m.shape[1]
 
+        self.k = k
+        self.lambda_knn = lambda_knn
+
+        self.Xtr = torch.tensor(model.Z_train[:, :-1], dtype=torch.float32, device=self.device) # (n, p-1)
+        self.ytr = torch.tensor(model.Z_train[:, -1], dtype=torch.float32, device=self.device) # (n,)
+
         self.mean_y = float(model.Z_train[:, -1].mean())
         
     def E_phi_batch(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        """
-        [NEW] Vectorized calculation of E_phi for a batch of (X,Y) pairs.
-        E_phi(x,y) = k_c(z,z) - ||A_m^T k_c(z)||^2, where z=(x,y).
-
-        Args:
-            X: Batch of x vectors, shape (b, p-1).
-            Y: Batch of y values, shape (b, 1).
-
-        Returns:
-            Tensor of feature errors for each sample in the batch, shape (b,).
-        """
         b = X.shape[0]
         Z = torch.cat([X, Y], dim=1)
 
@@ -286,6 +292,48 @@ class TorchProjector:
 
         return k_c_selfs - proj_energy
     
+    def _find_knn_neighbors(self, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        dist2_matrix = torch.cdist(X, self.Xtr, p=2)**2
+        
+        neighbor_dists_sq, neighbor_indices = torch.topk(
+            dist2_matrix + 1e-8, 
+            k=self.k, 
+            dim=1, #since the cdist return the distance matrix, value in row i is the distance between X[i] and all Xtr. dim=1 search for row
+            largest=False
+        )
+
+        y_neighbors = self.ytr[neighbor_indices]
+        
+        weights = 1.0 / neighbor_dists_sq
+        weights = weights / weights.sum(dim=1, keepdims=True)
+        
+        return y_neighbors, weights
+    
+    def R_knn_batch(self, 
+                    Y: torch.Tensor, 
+                    y_neighbors: torch.Tensor, 
+                    weights: torch.Tensor) -> torch.Tensor:
+        Y_expanded = Y.expand(-1, self.k)
+        
+        diff_sq = (Y_expanded - y_neighbors) ** 2
+        weighted_diff_sq = weights * diff_sq
+        
+        R_knn = weighted_diff_sq.sum(dim=1)
+        return R_knn
+    
+    def total_loss_batch(self, 
+                         X: torch.Tensor, 
+                         Y: torch.Tensor,
+                         y_neighbors: Optional[torch.Tensor],
+                         weights: Optional[torch.Tensor]) -> torch.Tensor:
+        E_phi = self.E_phi_batch(X, Y)
+        
+        if self.lambda_knn == 0.0 or self.k == 0:
+            return E_phi
+            
+        R_knn = self.R_knn_batch(Y, y_neighbors, weights)
+        return E_phi + self.lambda_knn * R_knn
+
     def predict_y_batch(self,
                         X_np: Array,
                         y_init: Optional[Array] = None,
@@ -300,6 +348,12 @@ class TorchProjector:
         best_Y = torch.zeros(b, 1, dtype=torch.float32, device=self.device)
         best_vals = torch.full((b,), float('inf'), dtype=torch.float32, device=self.device)
 
+        with torch.no_grad():
+            if self.k > 0 and self.lambda_knn > 0.0:
+                y_neighbors_precomputed, weights_precomputed = self._find_knn_neighbors(X)
+            else:
+                y_neighbors_precomputed, weights_precomputed = None, None
+                
         for r in range(restarts):
             if y_init is not None:
                 base_init = torch.tensor(y_init, dtype=torch.float32, device=self.device).view(-1, 1)
@@ -317,7 +371,9 @@ class TorchProjector:
 
             for _ in range(steps):
                 opt.zero_grad(set_to_none=True)
-                loss = self.E_phi_batch(X, Y).sum()
+                loss = self.total_loss_batch(X, Y, 
+                                             y_neighbors_precomputed, 
+                                             weights_precomputed).sum()
                 loss.backward()
                 opt.step()
 
@@ -327,41 +383,26 @@ class TorchProjector:
                 best_vals[is_better] = current_vals[is_better]
                 best_Y[is_better] = Y[is_better]
 
-        return best_Y.squeeze().cpu().numpy()    
+        return best_Y.squeeze(dim = 1).cpu().numpy()    
 
-def evaluate_kernels_with_torch_argmin(Z_train: Array,
-                                       X_test: Array,
-                                       y_test: Optional[Array] = None,
-                                       batch_size: Optional[int] = None,
-                                       kernel_choice: str = "all",
-                                       poly_degrees: Union[str, List[int]] = "all",
-                                       rbf_sigmas: Union[str, List[float]] = "all",
-                                       m: Optional[int] = None,
-                                       evr_target: Optional[float] = 0.95,
-                                       lr: float = 0.05,
-                                       steps: int = 300) -> pd.DataFrame:
-    if poly_degrees == "all":
-        poly_degrees = [1, 2, 3, 4]
-    if rbf_sigmas == "all":
-        rbf_sigmas = [0.25, 0.5, 1.0, 2.0]
-
-    configs: List[KernelConfig] = []
-    if kernel_choice in ("poly", "all"):
-        for d in poly_degrees:
-            configs.append(KernelConfig(kind="poly", params={"degree": int(d), "c0": 0.0}))
-    if kernel_choice in ("rbf", "all"):
-        for s in rbf_sigmas:
-            configs.append(KernelConfig(kind="rbf", params={"sigma": float(s)}))
+def predict(models: List[KPCAResult],
+            X_test: Array,
+            y_test: Optional[Array] = None,
+            k: int = 0,
+            lambda_knn: float = 0.0,
+            batch_size: Optional[int] = None,
+            lr: float = 0.05,
+            steps: int = 300) -> pd.DataFrame:
 
     rows = []
     results = []
     # X_te = Z_test[:, :-1]
     # y_true = Z_test[:, -1]
 
-    for cfg in configs:
-        print(f"Evaluating kernel: {cfg.kind}, params: {cfg.params}")
-        model = kpca_fit(Z_train, cfg, m=m, evr_target=evr_target)
-        projector = TorchProjector(model)
+    for model in models:
+        cfg = model.kernel_cfg
+        print(f"Predicting with: {cfg.kind}, params: {cfg.params}, k={k}, lambda={lambda_knn}")
+        projector = TorchProjector(model, k=k, lambda_knn=lambda_knn)
 
         if batch_size is None or batch_size >= len(X_test):
             y_pred = projector.predict_y_batch(X_test, lr=lr, steps=steps)
@@ -370,18 +411,17 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
             y_pred_parts = []
             num_samples = len(X_test)
             for i in range(0, num_samples, batch_size):
-                print(f"  Processing batch {i//batch_size + 1}...")
+                #print(f"  Processing batch {i//batch_size + 1}...")
                 X_batch = X_test[i : i + batch_size]
                 y_pred_batch = projector.predict_y_batch(X_batch, lr=lr, steps=steps)
                 y_pred_parts.append(y_pred_batch)
             
             # Combine the results from all batches
             y_pred = np.concatenate(y_pred_parts)
-        #y_pred = projector.predict_y_batch(X_te, lr=lr, steps=steps, restarts=1)
         if y_test is not None:
-            mse_y = float(np.mean((y_pred - y_test) ** 2))
+            rmse_y = np.sqrt(float(np.mean((y_pred - y_test) ** 2)))
         else:
-            mse_y = None
+            rmse_y = None
 
         with torch.no_grad():
             x_tensor = torch.tensor(X_test, dtype=torch.float32)
@@ -393,7 +433,7 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
             "kernel": cfg.kind,
             "params": cfg.params,
             "m": model.m,
-            "MSE_yhat_vs_y": mse_y,
+            "RMSE_yhat_vs_y": rmse_y,
             "mean_feature_residual": mean_residual
         })
         results.append({
@@ -406,61 +446,99 @@ def evaluate_kernels_with_torch_argmin(Z_train: Array,
  
 
 if __name__ == "__main__":
-    # n_samples = 200
-    # theta = np.linspace(0, 2 * np.pi, n_samples)
-    # r = 1.0
-    # X = np.column_stack((r * np.cos(theta), r * np.sin(theta)))
-
-    # noise_level = 0.5
-    # X_noisy = X + noise_level * np.random.randn(*X.shape)
-
-    Z_train, Z_test = make_data_combined(n_train=450, n_test=50, n_features=1 ,seed=0, noise_level=0.25)
-
-    df_results = evaluate_kernels(
-        Z_train,
-        Z_test,
-        kernel_choice="all",
-        poly_degrees=[1, 2, 3],
-        rbf_sigmas="all",
-        m=None,
-        evr_target=0.99
-    )
-    print("Feature-space orthogonal MSE (train/test):")
-    print(df_results)
+    Z_train, Z_test = make_data_combined(n_train=450, n_test=50, n_features=1 ,seed=0, noise_level=0.15)
+    Z_train_clean, Z_test_clean = make_data_combined(n_train=450, n_test=50, n_features=1 ,seed=0, noise_level=0.0)
 
     X_train = Z_train[:, :-1]
     y_train = Z_train[:, -1]
+
     Xq = np.linspace(X_train.min(), X_train.max(), 400)[:, None]
 
     X_test = Z_test[:, :-1]
     y_test = Z_test[:, -1]
 
-    df_argmin, results = evaluate_kernels_with_torch_argmin(
-        Z_train, Xq,
-        kernel_choice="rbf",
+    fitted_models = fit_all_kernels(
+        Z_train,
+        kernel_choice="all",
         poly_degrees=[1, 2, 3],
-        rbf_sigmas=[0.5, 2, 4, 6],
+        rbf_sigmas="all",
         m=None,
-        evr_target=0.99,
+        evr_target=0.9
+    )
+
+    # df_results = evaluate_models(
+    #     fitted_models,
+    #     Z_test,
+    # )
+
+    # df_results_clean = evaluate_models(
+    #     fitted_models,
+    #     Z_test_clean,
+    # )
+
+    df_results, _ = predict(
+        fitted_models,
+        X_test=X_test,
+        y_test=y_test,
+        k=6,
+        lambda_knn=0.0,
+        batch_size=None,
         lr=0.05,
         steps=300
     )
-    print("\nInput-space MSE on y (argmin over y) and residual at optimum:")
-    print(df_argmin)
 
-    yq_preds = { (row['kernel'], str(row['params'])): row['pred'] for row in results }
+    df_results_clean, _ = predict(
+        fitted_models,
+        X_test=Z_test_clean[:, :-1],
+        y_test=Z_test_clean[:, -1],
+        k=6,
+        lambda_knn=0.0,
+        batch_size=None,
+        lr=0.05,
+        steps=300
+    )
 
-    for (kernel, params), yq_pred in yq_preds.items():
-        plt.figure(figsize=(8, 5))
+    print("Feature-space orthogonal RMSE (train/test):")
+    print(df_results)
 
-        plt.plot(Xq[:, 0], yq_pred, label=f"Prediction: {kernel}, {params}")
+    print("Feature-space orthogonal RMSE clean (train/test):")
+    print(df_results_clean)
 
-        plt.scatter(X_train[:, 0], y_train, s=25, color="red", alpha=0.8, label="train")
-        plt.scatter(X_test[:, 0], y_test, s=25, color="blue", alpha=0.7, label="test")
+    print("Robustness score:")
+    print(df_results_clean["RMSE_yhat_vs_y"] / df_results["RMSE_yhat_vs_y"])
 
-        plt.xlabel("x")
-        plt.ylabel("y / prediction")
-        plt.title(f"NPCA Regression with {kernel}")
-        plt.legend()
+    # X_train_clean = Z_train_clean[:, :-1]
+    # y_train_clean = Z_train_clean[:, -1]
+    # Xq = np.linspace(X_train.min(), X_train.max(), 400)[:, None]
 
-    plt.show()
+    # X_test_clean = Z_test_clean[:, :-1]
+    # y_test = Z_test_clean[:, -1]
+
+    # uncomment for prediction and plotting
+    # df_argmin, results = predict(
+    #     fitted_models, Xq,
+    #     k=6,
+    #     lambda_knn=0.0,
+    #     batch_size=None,
+    #     lr=0.05,
+    #     steps=300
+    # )
+    # print("\nInput-space RMSE on y (argmin over y) and residual at optimum:")
+    # print(df_argmin)
+
+    # yq_preds = { (row['kernel'], str(row['params'])): row['pred'] for row in results }
+
+    # for (kernel, params), yq_pred in yq_preds.items():
+    #     plt.figure(figsize=(8, 5))
+
+    #     plt.plot(Xq[:, 0], yq_pred, label=f"Prediction: {kernel}, {params}")
+
+    #     plt.scatter(X_train[:, 0], y_train, s=25, color="red", alpha=0.8, label="train")
+    #     plt.scatter(X_test[:, 0], y_test, s=25, color="blue", alpha=0.7, label="test")
+
+    #     plt.xlabel("x")
+    #     plt.ylabel("y / prediction")
+    #     plt.title(f"NPCA Regression with {kernel}")
+    #     plt.legend()
+
+    # plt.show()

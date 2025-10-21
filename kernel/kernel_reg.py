@@ -43,8 +43,8 @@ def loo_from_hat(y: Array, yhat: Array, sdiag: Array, eps: float = 1e-12) -> Arr
     den = 1 - np.clip(sdiag, 0.0, 1.0 - eps)
     return (yhat - sdiag*y) / den
 
-def mse(a: Array, b: Array) -> float:
-    return float(np.mean((a - b)**2))
+def rmse(a: Array, b: Array) -> float: 
+    return float(np.sqrt(np.mean((a - b)**2)))
 
 def mae(a: Array, b: Array) -> float:
     return float(np.mean(np.abs(a - b)))
@@ -131,7 +131,7 @@ class NadarayaWatsonRegressor:
             W, sdiag = self.smoother_matrix(h=float(h_val))
             yhat = W @ self.y_
             yloo = loo_from_hat(self.y_, yhat, sdiag)
-            cv = mse(self.y_, yloo)
+            cv = rmse(self.y_, yloo)
             if cv < best_cv:
                 best_cv, best_h = cv, float(h_val)
         
@@ -141,7 +141,7 @@ class NadarayaWatsonRegressor:
 
     def score(self, kind: Literal["mse","mae"]="mse", loo: bool=False) -> float:
         ypred = self.loo_predict_train() if loo else self.predict_train()
-        fn = mse if kind=="mse" else mae
+        fn = rmse if kind=="mse" else mae
         return fn(self.y_, ypred)
 
 @dataclass
@@ -212,7 +212,7 @@ if __name__ == "__main__":
     h_star = kr.select_bandwidth(grid)
     print(f"Selected h = {h_star:.3f} | Final Train MSE={kr.score():.4f} | Final LOO MSE={kr.score(loo=True):.4f}")
 
-    print(f"Test MSE={mse(y_test, kr.predict(X_test)):.4f}")
+    print(f"Test MSE={rmse(y_test, kr.predict(X_test)):.4f}")
 
     Xq = np.linspace(X_train.min(), X_train.max(), 400)[:, None]
     Xqz = (Xq - mu)/sd
