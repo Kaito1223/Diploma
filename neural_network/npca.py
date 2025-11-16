@@ -108,8 +108,8 @@ def load_and_prepare_image(path, size=(128, 128)):
 
 # Simulate mixed signals
 np.random.seed(0)
-img1 = load_and_prepare_image('lena.png')       # Provide paths to your images
-img2 = load_and_prepare_image('camera_man.png')  # Replace with actual file paths
+img1 = load_and_prepare_image('lena.png')
+img2 = load_and_prepare_image('camera_man.png')
 
 # Flatten images into signals
 s1 = img1.flatten()

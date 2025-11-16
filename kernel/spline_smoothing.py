@@ -176,27 +176,23 @@ class TPSRegressor:
     
 if __name__ == '__main__':
     X_train, y_train, X_test, y_test = make_data_separated(
-        n_train=500,
-        n_test=80,
+        n_train=450,
+        n_test=50,
         n_features=1,
-        seed=42,
-        noise_level=0.3,
-        distribution='uniform',
-        dist_params={'low': -np.pi, 'high': np.pi}
+        seed=0,
+        noise_level=0.05,
     )
 
-    lambda_reg = 9
+    lambda_reg = 10
     print(f"Fitting TPS Regressor with lambda = {lambda_reg}...")
     model = TPSRegressor(lambda_=lambda_reg, m=2, standardize=True)
     model.fit(X_train, y_train)
 
-    print("Evaluating model performance...")
     y_pred = model.predict(X_test)
     mse = np.mean((y_test - y_pred)**2)
     rmse = np.sqrt(mse)
-    print(f"  -> Root Mean Squared Error on Test Set: {rmse:.4f}")
+    print(f"Root Mean Squared Error on Test Set: {rmse:.4f}")
 
-    print("Creating 2D visualization...")
     fig, ax = plt.subplots(figsize=(10, 6))
 
     x_grid = np.linspace(X_train.min(), X_train.max(), 500).reshape(-1, 1)
